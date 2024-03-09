@@ -44,6 +44,10 @@ use std::{collections::HashSet, sync::atomic::{AtomicBool, AtomicPtr, AtomicUsiz
 
 use lazy_static::lazy_static;
 
+fn debug(s: &str) {
+    println!("{}", s);
+}
+
 pub trait Deleter {
     fn delete(&self);
 }
@@ -65,7 +69,7 @@ lazy_static! {
 // Base class for protected objects.
 // hazptr_obj_base in folly.
 trait HazPtrObjBase {
-    fn domain(&self) -> &HazPtrDomain;
+    fn domain(&self) -> &'static HazPtrDomain;
 
     fn deleter(&self) -> &'static dyn Deleter;
 
@@ -76,12 +80,18 @@ trait HazPtrObjBase {
     // Put myself into domain's retire list, providing a Drop func.
     fn retire(&mut self) {
         let deleter = self.deleter();
-        self.domain().retire(self as *const Self as *const (), deleter);
+        let domain = self.domain().clone();
+        domain.retire(self as *mut Self as *mut u8, deleter);
     }
+
+    // fn retire_by(self: *mut Self, deleter: &'static dyn Deleter) {
+    //     self.domain().retire(self as *mut Self as *mut u8, deleter);
+    // }
 }
 
 /// Every thread creates its own `HazPtr` with the same ptr.
 // hazptr_obj in folly.
+#[derive(Debug)]
 pub struct HazPtr {
     ptr: AtomicPtr<u8>,
     next: AtomicPtr<HazPtr>,
@@ -118,11 +128,14 @@ impl HazPtrHolder {
     // Get a hazptr.
     fn hazptr(&mut self) -> &HazPtr {
         if let Some(p) = self.inner {
+            debug("has hazptr");
             // We can reused.
             p
         } else {
             // Allocate a hazptr
+            debug("acquire hazptr");
             let p = SHARED_DOMAIN.acquire();
+            debug(&format!("acquired hazptr {:?}", p as *const _ as *const u8));
             self.inner = Some(p);
             p
         }
@@ -132,6 +145,7 @@ impl HazPtrHolder {
     ///  T* protect(const atomic<T*>& src);
     pub fn load<T>(&mut self, ptr: &AtomicPtr<T>) -> &T {
         let hazptr = self.hazptr();
+        debug("got hazptr");
         // Check the ptr is not mutated during the peotecting.
         let mut before = ptr.load(Ordering::SeqCst);
         loop {
@@ -155,6 +169,7 @@ impl HazPtrHolder {
 
 impl Drop for HazPtrHolder {
     fn drop(&mut self) {
+        debug("drop holder");
         self.reset();
 
         if let Some(hazptr) = self.inner {
@@ -177,13 +192,13 @@ impl HazPtrList {
 
 struct Retired {
     // There will be `HazPtr`s for diffferent `ptr`s in retired list.
-    ptr: *const (),
+    ptr: *mut u8,
     deleter: &'static dyn Deleter,
     next: AtomicPtr<Retired>,
 }
 
 impl Retired {
-    fn new(ptr: *const (), deleter: &'static dyn Deleter) -> Self {
+    fn new(ptr: *mut u8, deleter: &'static dyn Deleter) -> Self {
         Retired {
             ptr,
             deleter,
@@ -220,23 +235,49 @@ impl HazPtrDomain {
         }
     }
 
-    fn maybe_gc(&self) {
-        self.gc()
+    fn maybe_gc(&self) -> usize {
+        self.gc(false)
+    }
+
+    fn activate_count(&self) -> usize {
+        let mut l = self.hazptrs.head.load(Ordering::SeqCst);
+        let mut debug_count = 0;
+        while !l.is_null() {
+            let r = unsafe {&*l};
+            if r.active.load(Ordering::SeqCst) {
+                debug_count += 1;
+            }
+            l = r.next.load(Ordering::SeqCst);
+        }
+        debug_count
+    }
+
+    fn retired_count(&self) -> usize {
+        let mut l = self.retired.head.load(Ordering::SeqCst);
+        let mut debug_count = 0;
+        while !l.is_null() {
+            let r = unsafe {&*l};
+            debug_count += 1;
+            l = r.next.load(Ordering::SeqCst);
+        }
+        debug_count
     }
 
     // We must make sure there is no attaching reader before reclaiming(gc) the pointer.
-    fn gc(&self) {
+    fn gc(&self, block: bool) -> usize {
         // We will address `count` later.
         let old_head = self.retired.head.swap(std::ptr::null_mut(), Ordering::SeqCst);
         if old_head.is_null() {
-            return;
+            return 0;
         }
 
-        let mut l = old_head.clone();
+        let mut l = self.hazptrs.head.load(Ordering::SeqCst);
         let mut remaining_readers = HashSet::new();
         while !l.is_null() {
             let r = unsafe {&*l};
-            remaining_readers.insert(r.ptr);
+            if r.active.load(Ordering::SeqCst) {
+                remaining_readers.insert(r.ptr.load(Ordering::SeqCst));
+            }
             l = r.next.load(Ordering::SeqCst);
         }
 
@@ -251,9 +292,11 @@ impl HazPtrDomain {
             let r = unsafe {&*l};
             let next = r.next.load(Ordering::SeqCst);
             if !remaining_readers.contains(&r.ptr) {
+                debug(&format!("gced {:?}", r.ptr));
                 r.deleter.delete();
                 reclaimed += 1;
             } else {
+                debug("has reader");
                 // TODO Can we merge Retired which points to the same ptr?
                 unsafe {&* tail}.next.store(l, Ordering::SeqCst);
                 tail = l;
@@ -261,12 +304,14 @@ impl HazPtrDomain {
             l = next;
         }
         if tail != dummy {
+            // If there is something remaining.
             let mut cur_head = self.retired.head.load(Ordering::SeqCst);
+            let real_new_head = unsafe {&*new_head}.next.load(Ordering::SeqCst);
             loop {
                 unsafe {&* tail}.next.store(cur_head, Ordering::SeqCst);
                 match self.retired.head.compare_exchange_weak(
                     cur_head,
-                    new_head,
+                    real_new_head,
                     Ordering::SeqCst,
                     Ordering::SeqCst,
                 ) {
@@ -280,15 +325,25 @@ impl HazPtrDomain {
             }
         }
         self.retired.count.fetch_sub(reclaimed, Ordering::SeqCst);
+        if tail != dummy && block {
+            // Caller wants to reclaim _everything_, but some were left, so try again.
+            std::thread::yield_now();
+            // NOTE: Allows tail recursion by passing down reclaimed
+            return reclaimed + self.gc(true);
+        }
+        debug(&format!("gc finish {} is_block {}", reclaimed, block));
+        reclaimed
     }
 
-    fn retire(&self, ptr: *const (), deleter: &'static dyn Deleter) {
-        let r = Retired::new(ptr, deleter);
-        let rp = Box::into_raw(Box::new(r));
+    fn retire(&self, ptr: *mut u8, deleter: &'static dyn Deleter) {
+        debug("retired");
         self.retired.count.fetch_add(1, Ordering::SeqCst);
         let mut head_ptr = self.retired.head.load(Ordering::SeqCst);
 
         loop {
+            let r = Retired::new(ptr, deleter);
+            r.next.store(head_ptr, Ordering::SeqCst);
+            let rp = Box::into_raw(Box::new(r));
             match self.retired.head.compare_exchange_weak(
                 head_ptr,
                 rp,
@@ -304,7 +359,9 @@ impl HazPtrDomain {
             }
         }
 
-        self.maybe_gc();
+        if self.retired.count.load(Ordering::SeqCst) != 0 {
+            self.maybe_gc();
+        }
     }
 
     fn acquire(&self) -> &HazPtr {
@@ -312,14 +369,15 @@ impl HazPtrDomain {
         let mut cur = head_ptr.clone();
         loop {
             // Iterate over all list to find something to reuse.
-            while !cur.is_null() && !unsafe { &*cur }.active.load(Ordering::SeqCst) {
+            while !cur.is_null() && unsafe { &*cur }.active.load(Ordering::SeqCst) {
                 cur = unsafe { &*cur }.next.load(Ordering::SeqCst);
             }
             if cur.is_null() {
+                debug("aq by allocate");
                 // Should allocate a new node.
-                let nn = HazPtr::new();
-                let nnb: *mut HazPtr = Box::into_raw(Box::new(nn));
+                let nnb: *mut HazPtr = Box::into_raw(Box::new(HazPtr::new()));
                 let safe_nnb = unsafe { &*nnb };
+                safe_nnb.next.store(head_ptr, Ordering::SeqCst);
                 match self.hazptrs.head.compare_exchange_weak(
                     head_ptr,
                     nnb,
@@ -334,6 +392,7 @@ impl HazPtrDomain {
                     }
                 }
             } else {
+                debug("aq by reuse");
                 let safe_cur = unsafe { &*cur };
                 if safe_cur
                     .active
@@ -367,7 +426,7 @@ impl<T> HazPtrObjBase for HazPtrObj<T> {
         &*DUMMY_DELETER
     }
 
-    fn domain(&self) -> &HazPtrDomain {
+    fn domain(&self) -> &'static HazPtrDomain {
         self.domain
     }
 }
@@ -384,8 +443,109 @@ mod tests {
         }
     }
 
+    pub mod deleters {
+        fn drop_in_place2(ptr: *mut dyn Drop) {
+            // Safe by the contract on HazPtrObject::retire.
+            unsafe { std::ptr::drop_in_place(ptr) };
+        }
+        /// Always safe to use given requirements on HazPtrObject::retire,
+        /// but may lead to memory leaks if the pointer type itself needs drop.
+        #[allow(non_upper_case_globals)]
+        pub static drop_in_place: fn(*mut dyn Drop) = drop_in_place2;
+    
+        fn drop_box2(ptr: *mut dyn Drop) {
+            // Safety: Safe by the safety gurantees of retire and because it's only used when
+            // retiring Box objects.
+            let _ = unsafe { Box::from_raw(ptr) };
+        }
+    
+        /// # Safety
+        ///
+        /// Can only be used on values that were originally derived from a Box.
+        #[allow(non_upper_case_globals)]
+        pub static drop_box: fn(*mut dyn Drop) = drop_box2;
+    }
+
     #[test]
-    fn feels_good() {
+    fn test_write() {
+        debug("start");
+        let drops_42 = Arc::new(AtomicUsize::new(0));
+
+        let cd = CountDrops(Arc::clone(&drops_42));
+        let x = AtomicPtr::new(Box::into_raw(Box::new(
+            HazPtrObj::new_with_shared((42, cd))),
+        ));
+        
+        let mut h = HazPtrHolder::default();
+        let p2 = h.hazptr() as *const _ as usize;
+        let my_x = unsafe { h.load(&x) };
+        assert_eq!(SHARED_DOMAIN.activate_count(), 1);
+
+        let drops_9001 = Arc::new(AtomicUsize::new(0));
+        let cd2 = CountDrops(Arc::clone(&drops_9001));
+
+        // Change value of x.
+        let old = x.swap(
+            Box::into_raw(Box::new(HazPtrObj::new_with_shared(
+                (9001, cd2)),
+            )),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+
+        let mut h2 = HazPtrHolder::default();
+
+        let p1 = h2.hazptr().next.load(Ordering::SeqCst) as *const _ as usize;
+        assert_eq!(p1, p2);
+
+        let my_x2 = unsafe { h2.load(&x) };
+        assert_eq!(SHARED_DOMAIN.activate_count(), 2);
+
+        assert_eq!(my_x.inner.0, 42);
+        assert_eq!(my_x2.inner.0, 9001);
+
+        // Safety:
+        //
+        //  1. The pointer came from Box, so is valid.
+        //  2. The old value is no longer accessible.
+        //  3. The deleter is valid for Box types.
+        let old_ref = unsafe {&mut *old};
+        assert_eq!(SHARED_DOMAIN.retired_count(), 0);
+        // Shall not be reclaimed. Since is held by `h`.
+        unsafe { old_ref.retire() };
+        assert_eq!(SHARED_DOMAIN.activate_count(), 2);
+        assert_eq!(SHARED_DOMAIN.retired_count(), 1);
+
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
+        assert_eq!(my_x.inner.0, 42);
+
+        debug("must not gc some");
+        let n = SHARED_DOMAIN.gc(false);
+        assert_eq!(n, 0);
+
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
+        assert_eq!(my_x.inner.0, 42);
+
+        debug("drop h");
+        drop(h);
+        assert_eq!(drops_42.load(Ordering::SeqCst), 0);
+        // _not_ drop(h2);
+
+        debug("must gc some");
+        let n = SHARED_DOMAIN.gc(true);
+        assert_eq!(n, 1);
+
+        // assert_eq!(drops_42.load(Ordering::SeqCst), 1);
+        // assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
+
+        drop(h2);
+        let n = SHARED_DOMAIN.gc(false);
+        assert_eq!(n, 0);
+        assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn test_read() {
+        debug("start");
         let drops_42 = Arc::new(AtomicUsize::new(0));
 
         let cd = CountDrops(Arc::clone(&drops_42));
@@ -405,14 +565,14 @@ mod tests {
         assert_eq!(my_x.inner.0, 42);
         h.reset();
         // invalid:
-        // let _: i32 = my_x.0;
+        // let _: i32 = my_x.inner.0;
 
         let my_x = unsafe { h.load(&x) };
         // valid:
         assert_eq!(my_x.inner.0, 42);
         drop(h);
         // // invalid:
-        // let _: i32 = my_x.0;
+        // let _: i32 = my_x.inner.0;
 
         let mut h = HazPtrHolder::default();
         let my_x = unsafe { h.load(&x) };
@@ -420,53 +580,6 @@ mod tests {
         let mut h_tmp = HazPtrHolder::default();
         let _ = unsafe { h_tmp.load(&x) };
         drop(h_tmp);
-
-        // As a writer:
-        let drops_9001 = Arc::new(AtomicUsize::new(0));
-        let cd2 = CountDrops(Arc::clone(&drops_9001));
-        let old = x.swap(
-            Box::into_raw(Box::new(HazPtrObj::new_with_shared(
-                (42, cd2)),
-            )),
-            std::sync::atomic::Ordering::SeqCst,
-        );
-
-        // let mut h2 = HazPtrHolder::default();
-        // let my_x2 = unsafe { h2.load(&x) };
-
-        // assert_eq!(my_x.inner, 42);
-        // assert_eq!(my_x2.inner, 9001);
-
-        // // Safety:
-        // //
-        // //  1. The pointer came from Box, so is valid.
-        // //  2. The old value is no longer accessible.
-        // //  3. The deleter is valid for Box types.
-        // unsafe { old.retire(&deleters::drop_box) };
-
-        // assert_eq!(drops_42.load(Ordering::SeqCst), 0);
-        // assert_eq!(my_x.0, 42);
-
-        // let n = SHARED_DOMAIN.eager_reclaim(false);
-        // assert_eq!(n, 0);
-
-        // assert_eq!(drops_42.load(Ordering::SeqCst), 0);
-        // assert_eq!(my_x.0, 42);
-
-        // drop(h);
-        // assert_eq!(drops_42.load(Ordering::SeqCst), 0);
-        // // _not_ drop(h2);
-
-        // let n = SHARED_DOMAIN.eager_reclaim(false);
-        // assert_eq!(n, 1);
-
-        // assert_eq!(drops_42.load(Ordering::SeqCst), 1);
-        // assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
-
-        // drop(h2);
-        // let n = SHARED_DOMAIN.eager_reclaim(false);
-        // assert_eq!(n, 0);
-        // assert_eq!(drops_9001.load(Ordering::SeqCst), 0);
     }
 }
 
