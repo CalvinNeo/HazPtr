@@ -50,8 +50,15 @@ lazy_static! {
 
 // Base class for protected objects.
 trait HazPtrObj {
+    fn domain(&self) -> &HazPtrDomain;
+
+    fn deleter(&self) -> &'static dyn Deleter;
+
     /// Put myself into domain's retire list, providing a Drop func.
-    fn retire(&mut self) {}
+    fn retire(&mut self) {
+        let deleter = self.deleter();
+        self.domain().retire(deleter);
+    }
 }
 
 // hazptr_obj in folly.
@@ -163,7 +170,17 @@ impl HazPtrList {
 }
 
 struct Retired {
-    // TODO
+    deleter: &'static dyn Deleter,
+    next: AtomicPtr<Retired>,
+}
+
+impl Retired {
+    fn new(deleter: &'static dyn Deleter) -> Self {
+        Retired {
+            deleter,
+            next: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
 }
 
 struct RetiredList {
@@ -186,12 +203,47 @@ pub struct HazPtrDomain {
     retired: RetiredList,
 }
 
+pub trait Deleter {
+    fn delete(&mut self);
+}
+
 impl HazPtrDomain {
     fn new() -> Self {
         HazPtrDomain {
             hazptrs: HazPtrList::new(),
             retired: RetiredList::new(),
         }
+    }
+
+    fn maybe_gc(&self) {
+        self.gc()
+    }
+
+    fn gc(&self) {}
+
+    fn retire(&self, deleter: &'static dyn Deleter) {
+        let r = Retired::new(deleter);
+        let rp = Box::into_raw(Box::new(r));
+        self.retired.count.fetch_add(1, Ordering::SeqCst);
+        let mut head_ptr = self.retired.head.load(Ordering::SeqCst);
+
+        loop {
+            match self.retired.head.compare_exchange_weak(
+                head_ptr,
+                rp,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    break;
+                }
+                Err(head) => {
+                    head_ptr = head;
+                }
+            }
+        }
+
+        self.maybe_gc();
     }
 
     fn acquire(&self) -> &HazPtr {
